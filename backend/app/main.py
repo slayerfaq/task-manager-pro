@@ -1,30 +1,26 @@
 """
 Task Manager Pro - Main Application
-FastAPI приложение с полной интеграцией Vault
+FastAPI приложение с Vault и Keycloak SSO интеграцией
 """
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from sqlalchemy.orm import Session
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi.responses import Response
 import time
 import structlog
+from typing import Optional, List
 
 from .core.config import settings
 from .core.database import init_db, get_db, check_db_connection, engine
 from .core.redis_client import redis_client
-from .core.security import (
-    authenticate_user, create_access_token, get_current_user,
-    get_current_active_admin, get_password_hash, revoke_token
-)
-from .core.keycloak import keycloak_client, init_keycloak_from_vault
 from .core.vault import vault_client
-from .models.models import User, Task, Tag, PriorityEnum, StatusEnum
+from .core.keycloak import keycloak_client, init_keycloak_from_vault
+from .core.security import get_current_user, get_current_active_admin
+from .models.models import User, Task, PriorityEnum, StatusEnum
 from .schemas import schemas
+from .api import auth
 
 # Настройка логирования
 structlog.configure(
@@ -49,12 +45,21 @@ DB_CONNECTIONS = Gauge('database_connections_active', 'Active DB connections')
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
-    logger.info("application_starting")
+    logger.info("application_starting", version=settings.api_version)
     
     # Startup
     try:
         # Инициализация БД
         init_db()
+        logger.info("database_initialized")
+        
+        # Инициализация Keycloak из Vault
+        try:
+            init_keycloak_from_vault(vault_client)
+            logger.info("keycloak_sso_enabled", realm=keycloak_client.realm if keycloak_client else None)
+        except Exception as e:
+            logger.warning("keycloak_init_failed", error=str(e))
+            logger.info("sso_disabled_using_local_auth_only")
         
         # Проверка соединений
         if not check_db_connection():
@@ -63,28 +68,11 @@ async def lifespan(app: FastAPI):
         if not redis_client.ping():
             raise Exception("Redis connection failed")
         
-        # Создание admin пользователя из Vault
-        with engine.begin() as conn:
-            from sqlalchemy import text
-            result = conn.execute(text("SELECT COUNT(*) FROM users WHERE username = :username"),
-                                {"username": settings.admin_username})
-            if result.scalar() == 0:
-                logger.info("creating_admin_user")
-                conn.execute(
-                    text("""
-                        INSERT INTO users (username, email, hashed_password, full_name, is_active, is_admin)
-                        VALUES (:username, :email, :password, :full_name, true, true)
-                    """),
-                    {
-                        "username": settings.admin_username,
-                        "email": f"{settings.admin_username}@taskmanager.local",
-                        "password": get_password_hash(settings.admin_password),
-                        "full_name": "System Administrator"
-                    }
-                )
-                logger.info("admin_user_created", username=settings.admin_username)
-        
-        logger.info("application_started")
+        logger.info("all_dependencies_ready", 
+                   database="ok", 
+                   redis="ok",
+                   vault="ok",
+                   keycloak="ok" if keycloak_client else "disabled")
         
     except Exception as e:
         logger.error("application_startup_failed", error=str(e))
@@ -142,12 +130,20 @@ async def metrics_middleware(request, call_next):
     return response
 
 
+# Include routers
+app.include_router(auth.router)
+
+
 # ==================== HEALTH ENDPOINTS ====================
 
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Базовая проверка здоровья"""
-    return {"status": "healthy", "version": settings.api_version}
+    return {
+        "status": "healthy",
+        "version": settings.api_version,
+        "timestamp": time.time()
+    }
 
 
 @app.get("/ready", tags=["Health"])
@@ -156,10 +152,19 @@ async def readiness_check():
     checks = {
         "database": check_db_connection(),
         "redis": redis_client.ping(),
-        "vault": vault_client.client.is_authenticated() if vault_client.client else False
+        "vault": vault_client.client.is_authenticated() if vault_client.client else False,
+        "keycloak": False
     }
     
-    if not all(checks.values()):
+    # Проверка Keycloak
+    if keycloak_client:
+        try:
+            keycloak_client.get_openid_configuration()
+            checks["keycloak"] = True
+        except:
+            checks["keycloak"] = False
+    
+    if not all([checks["database"], checks["redis"]]):
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "not_ready", "checks": checks}
@@ -175,119 +180,7 @@ async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-# ==================== AUTHENTICATION ====================
-
-@app.post("/api/auth/login", response_model=schemas.Token, tags=["Authentication"])
-async def login(
-    form_data: schemas.LoginRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    Вход в систему
-    Credentials берутся из Vault
-    """
-    user = authenticate_user(db, form_data.username, form_data.password)
-    
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    # Создаем токен
-    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
-    access_token = create_access_token(
-        data={"sub": user.username, "user_id": user.id},
-        expires_delta=access_token_expires
-    )
-    
-    # Сохраняем сессию в Redis
-    redis_client.set_session(
-        access_token,
-        {
-            "user_id": user.id,
-            "username": user.username,
-            "is_admin": user.is_admin
-        }
-    )
-    
-    logger.info("user_logged_in", user_id=user.id, username=user.username)
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "full_name": user.full_name,
-            "is_admin": user.is_admin
-        }
-    }
-
-
-@app.post("/api/auth/logout", tags=["Authentication"])
-async def logout(current_user: User = Depends(get_current_user)):
-    """Выход из системы"""
-    # Здесь можно добавить логику отзыва токена
-    logger.info("user_logged_out", user_id=current_user.id)
-    return {"message": "Successfully logged out"}
-
-
-@app.get("/api/auth/me", response_model=schemas.UserResponse, tags=["Authentication"])
-async def get_current_user_info(current_user: User = Depends(get_current_user)):
-    """Получение информации о текущем пользователе"""
-    return current_user
-
-
-# ==================== USERS ====================
-
-@app.post("/api/users", response_model=schemas.UserResponse, tags=["Users"])
-async def create_user(
-    user_data: schemas.UserCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_admin)
-):
-    """Создание нового пользователя (только для админов)"""
-    # Проверка уникальности
-    if db.query(User).filter(User.username == user_data.username).first():
-        raise HTTPException(status_code=400, detail="Username already exists")
-    
-    if db.query(User).filter(User.email == user_data.email).first():
-        raise HTTPException(status_code=400, detail="Email already exists")
-    
-    # Создание пользователя
-    user = User(
-        username=user_data.username,
-        email=user_data.email,
-        hashed_password=get_password_hash(user_data.password),
-        full_name=user_data.full_name,
-        is_admin=user_data.is_admin
-    )
-    
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    
-    logger.info("user_created", user_id=user.id, username=user.username)
-    
-    return user
-
-
-@app.get("/api/users", response_model=list[schemas.UserResponse], tags=["Users"])
-async def list_users(
-    skip: int = 0,
-    limit: int = 100,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Список пользователей"""
-    users = db.query(User).offset(skip).limit(limit).all()
-    return users
-
-
-# ==================== TASKS ====================
+# ==================== TASKS CRUD ====================
 
 @app.post("/api/tasks", response_model=schemas.TaskResponse, status_code=201, tags=["Tasks"])
 async def create_task(
@@ -317,7 +210,7 @@ async def create_task(
     return task
 
 
-@app.get("/api/tasks", response_model=list[schemas.TaskResponse], tags=["Tasks"])
+@app.get("/api/tasks", response_model=List[schemas.TaskResponse], tags=["Tasks"])
 async def list_tasks(
     skip: int = 0,
     limit: int = 100,
@@ -384,7 +277,7 @@ async def get_task(
 @app.put("/api/tasks/{task_id}", response_model=schemas.TaskResponse, tags=["Tasks"])
 async def update_task(
     task_id: int,
-    task_data: schemas.TaskUpdate,
+    task_update: schemas.TaskUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -398,7 +291,7 @@ async def update_task(
         raise HTTPException(status_code=404, detail="Task not found")
     
     # Обновляем поля
-    update_data = task_data.model_dump(exclude_unset=True)
+    update_data = task_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(task, field, value)
     
@@ -437,6 +330,20 @@ async def delete_task(
     logger.info("task_deleted", task_id=task_id, user_id=current_user.id)
 
 
+# ==================== USERS ====================
+
+@app.get("/api/users", response_model=List[schemas.UserResponse], tags=["Users"])
+async def list_users(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_admin)
+):
+    """Список пользователей (только для админов)"""
+    users = db.query(User).offset(skip).limit(limit).all()
+    return users
+
+
 # ==================== STATISTICS ====================
 
 @app.get("/api/stats", response_model=schemas.StatsResponse, tags=["Statistics"])
@@ -462,11 +369,11 @@ async def get_statistics(
     ).group_by(Task.priority).all()
     
     return {
-        "total_tasks": total,
-        "completed_tasks": completed,
-        "active_tasks": total - completed,
-        "by_status": {status: count for status, count in by_status},
-        "by_priority": {priority: count for priority, count in by_priority}
+        "total_tasks": total or 0,
+        "completed_tasks": completed or 0,
+        "active_tasks": (total or 0) - (completed or 0),
+        "by_status": {str(status): count for status, count in by_status},
+        "by_priority": {str(priority): count for priority, count in by_priority}
     }
 
 
